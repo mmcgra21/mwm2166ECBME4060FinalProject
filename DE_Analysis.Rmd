@@ -1,0 +1,148 @@
+---
+title:  "DE_Analysis"
+output: html_notebook
+name:   Michael McGrath
+uni:    mwm2166
+---
+
+# Use the gene counts data to perform a pairwise differential expression analysis.
+
+## Install packages.
+
+```{r}
+# install required CRAN packages
+for (pkg in c("BiocManager", "data.table", "httr", "FactoMineR", "googledrive", "statmod")) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg)
+  }
+}
+
+# install required Bioc packages
+for (pkg in c("limma", "edgeR", "GO.db", "org.Hs.eg.db")) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    BiocManager::install(pkg, update = FALSE, ask = FALSE)
+  }
+}
+```
+
+## Load in the count and metadata from Google drive or whereever the count data and preprocessed metadata is stored (the metadata should be preprocessed by `Metadata_Preprocess.ipynb`).
+
+```{r}
+library(data.table)
+library(httr)
+# change the file path to where you download the count table
+DATA <- "data"
+count_file_path <- "GSE156063_swab_gene_counts.csv.gz"
+meta_file_path <- "GSE156063_metadata.txt"
+# load the count table, set check.names to FALSE so R doesn't rename your columns!
+rc <- data.frame(fread(file.path(DATA, count_file_path)),
+                 row.names = 1, check.names = FALSE)
+meta <- read.table(file.path(DATA, meta_file_path),
+                   sep = "\t", check.names = FALSE,
+                   stringsAsFactors = FALSE, header = TRUE)
+```
+
+## Preprocess the metadata a bit more so that it is ready for the DE analysis.
+
+```{r}
+# Factor by viral_status
+meta$viral_status <- factor(meta$viral_status, levels=c("SC2", "no_virus", "other_virus"))
+# Convert the meta idseq_sample_name column to the same format as the row names in rc
+rownames(meta) <- sapply(meta$idseq_sample_name,
+                         function(x) {
+                           paste(strsplit(x, "_")[[1]][1:2], collapse="_")
+                           }
+                         )
+# Now lets convert the rownames of rc from ENSG to gene symbols
+# Read in list downloaded from the internet
+GENE_ENSEMBL_ID_LINK_BASE <- "https://www.genenames.org/cgi-bin/download/custom?col=gd_app_sym&col=gd_pub_ensembl_id&col=md_ensembl_id&hgnc_dbtag=on&order_by=gd_pub_ensembl_id&format=text&submit=submit"
+response <- GET(GENE_ENSEMBL_ID_LINK_BASE)
+ensembl <- data.frame(fread(text=httr::content(response, "parsed"), header=TRUE))
+colnames(ensembl) <- c("symbol", "ensembl_id1", "ensembl_id2")
+ens <- ensembl[(ensembl$ensembl_id1 != "") | (ensembl$ensembl_id2 != ""),]
+ens1 <- subset(ens, (ens$ensembl_id1 %in% row.names(rc)) & (ens$ensembl_id1 != ""))
+row.names(ens1) <- ens1$ensembl_id1
+ens2 <- subset(ens, ens$ensembl_id2 %in% row.names(rc) & (ens$ensembl_id2 != "") & (!(ens$ensembl_id1 %in% row.names(ens1))))
+row.names(ens2) <- ens2$ensembl_id2
+row.names(rc) <- sapply(row.names(rc),
+                        function(x) {
+                          ifelse(x %in% ens$ensembl_id1,
+                                 ens1[x, "symbol"],
+                                 ifelse(x %in% ens$ensembl_id2,
+                                        ens2[x, "symbol"],
+                                        x))
+                          }
+                        )
+```
+
+## Run the DE analysis on the count data, using the formula: `~0 + viral_status + gender + age`.
+
+```{r}
+library(limma)
+library(edgeR)
+dgelist <- DGEList(rc, group=meta$viral_status, remove.zeros = T,
+                   samples=meta, genes=row.names(rc))
+design <- model.matrix(~0 + viral_status + gender + age, data=meta)
+colnames(design) <- c("SC2", "no_virus", "other_virus", "genderM", "age")
+keep <- filterByExpr(dgelist, design=design, min.count=10, min.prop=0.2)
+dgelist <- dgelist[keep,,keep.lib.sizes=FALSE]
+dgelist <- calcNormFactors(dgelist, method="upperquartile")
+dgelist <- estimateDisp(dgelist, design)
+fit <- glmQLFit(dgelist, design)
+qlf <- glmQLFTest(fit)
+toptags <- as.data.frame(topTags(qlf, n=Inf))
+toptags
+```
+
+## Save the `fit` and `design` variables to be used in the GSE analysis (see `GSE_Analysis.Rmd`).
+
+```{r}
+save(fit, file="data/fit.RData")
+save(design, file="data/design.RData")
+```
+
+## Create contrasts to compare each of the `viral_status` group with the other two patient groups.
+
+```{r}
+# SC2 - no_virus
+contrast <- makeContrasts(SC2-no_virus, levels = design)
+qlf <- glmQLFTest(fit, contrast=contrast)
+SC2_vs_no_virus <- as.data.frame(topTags(qlf, n=Inf))
+# SC2 - other_virus
+contrast <- makeContrasts(SC2-other_virus, levels = design)
+qlf <- glmQLFTest(fit, contrast=contrast)
+SC2_vs_other_virus <- as.data.frame(topTags(qlf, n=Inf))
+# other_virus - no_virus
+contrast <- makeContrasts(other_virus-no_virus, levels = design)
+qlf <- glmQLFTest(fit, contrast=contrast)
+other_virus_vs_no_virus <- as.data.frame(topTags(qlf, n=Inf))
+```
+
+## Determine the most statistically significant genes with SARS-CoV-2 (Table 1 in paper).
+
+```{r}
+SC2_vs_no_virus[order(SC2_vs_no_virus$PValue),]
+```
+
+## Determine the genes that are the most down-regulated with SARS-CoV-2 compared to other respiratory viruses.
+
+```{r}
+SC2_vs_other_virus[order(SC2_vs_other_virus$logFC),]
+```
+
+## Portray the gene expression levels in each of the three patient groups for the IL1A and NLRP3 genes (Fig. 1 in paper).
+
+```{r}
+logcpm <- cpm(dgelist, log=TRUE)
+boxplot(logcpm["IL1A", ] ~ meta$viral_status, outpch=NA,
+        col="dodgerblue4", xlab="Viral Status", ylab=expression("IL1A log"[2]*"CPM"))
+stripchart(logcpm["IL1A", ] ~ meta$viral_status,
+           vertical = TRUE, method = "jitter", pch = 16, col = "black", add = TRUE) 
+```
+
+```{r}
+boxplot(logcpm["NLRP3", ] ~ meta$viral_status, outpch=NA,
+        col="dodgerblue4", xlab="Viral Status", ylab=expression("NLRP3 log"[2]*"CPM"))
+stripchart(logcpm["NLRP3", ] ~ meta$viral_status,
+           vertical = TRUE, method = "jitter", pch = 16, col = "black", add = TRUE) 
+```
